@@ -45,3 +45,13 @@ MAX_DB_PAGES = _int("MAX_DB_PAGES", 16_384)
 
 #: Maximum accepted length of each submitted SQL string.
 MAX_SQL_CHARS = _int("MAX_SQL_CHARS", 100_000)
+
+#: Admissible orderings contain at most 8 batches, i.e. at most 40320
+#: permutations, and the DFS tries at most one extension per prefix, so the
+#: node budget covers the entire search space even in the worst case.
+MAX_ORDER_SEARCH_NODES = _int("MAX_ORDER_SEARCH_NODES", 200_000)
+
+#: Wall-clock budget for one ordering request.  Exceeding it ends the search
+#: with ``search_limit``: unfinished branches are never evidence for
+#: "unique" or "no_solution".
+MAX_ORDER_SECONDS = _float("MAX_ORDER_SECONDS", 120.0)

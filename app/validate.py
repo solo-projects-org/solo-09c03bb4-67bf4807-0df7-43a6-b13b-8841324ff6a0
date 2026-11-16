@@ -21,7 +21,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import Batch, ChangeOp, InitialData
+from .models import (
+    AuthoritativeSnapshot,
+    Batch,
+    ChangeOp,
+    InitialData,
+)
+from .models import PrecedenceConstraint
 
 ORDER_FIELDS = ("order_id", "amount")
 REFUND_FIELDS = ("refund_id", "order_id", "amount")
@@ -212,3 +218,80 @@ def replay(
 
 def validate_all(initial: InitialData, batches: list[Batch]) -> None:
     replay(initial, batches)
+
+
+def validate_batch_shapes(batches: list[Batch]) -> None:
+    """Validate the *shape* of every change, independent of any state.
+
+    This separates malformed input (unknown fields, non-integer values,
+    out-of-range integers, missing/extra fields, non-positive keys) from
+    order-dependent illegality ("the update target does not exist yet").  The
+    former is a 422 input error; the latter merely prunes a search branch.
+    """
+    for batch in batches:
+        for index, op in enumerate(batch.changes):
+            where = f"批次 {batch.batch_id} 第 {index + 1} 个变更"
+            if op.after is not None:
+                _coerce_row(
+                    op.table, op.after, where=f"{where} after", partial=False
+                )
+            if op.before is not None:
+                _coerce_row(
+                    op.table, op.before, where=f"{where} before", partial=True
+                )
+
+
+def build_authoritative_state(
+    snapshot: AuthoritativeSnapshot, *, where: str = "authoritative"
+) -> SourceState:
+    """Build a :class:`SourceState` from a complete orders/refunds snapshot.
+
+    Unlike :func:`build_initial_state`, this has no 100-row input cap: the
+    state after ingesting every batch may legitimately be larger than the
+    initial state.  Keys must be unique and every refund must reference an
+    existing order.
+    """
+    state = SourceState()
+    for row in snapshot.orders:
+        if row.order_id in state.orders:
+            raise InputError(f"{where} orders 中 order_id={row.order_id} 重复")
+        _check_int64(row.amount, name="amount", where=f"{where} orders")
+        state.orders[row.order_id] = {"order_id": row.order_id, "amount": row.amount}
+    for row in snapshot.refunds:
+        if row.refund_id in state.refunds:
+            raise InputError(f"{where} refunds 中 refund_id={row.refund_id} 重复")
+        _check_int64(row.amount, name="amount", where=f"{where} refunds")
+        state.refunds[row.refund_id] = {
+            "refund_id": row.refund_id,
+            "order_id": row.order_id,
+            "amount": row.amount,
+        }
+    _check_fk(state, where=where)
+    return state
+
+
+def same_state(left: SourceState, right: SourceState) -> bool:
+    """Exact equality of the two source states (row order irrelevant)."""
+    return left.orders == right.orders and left.refunds == right.refunds
+
+
+def validate_precedence(
+    batches: list[Batch], precedence: list[PrecedenceConstraint]
+) -> None:
+    """Every precedence endpoint must name a submitted batch.
+
+    Duplicate or transitive-redundant relations are allowed; only a relation
+    whose endpoints are unknown, or a relation that is part of a cycle, makes
+    the whole problem unsolvable (reported as a node-less cycle in the search,
+    not as an input error) -- except for unknown ids, which are malformed input.
+    """
+    known = {batch.batch_id for batch in batches}
+    for index, relation in enumerate(precedence):
+        for role, value in (
+            ("before_batch_id", relation.before_batch_id),
+            ("after_batch_id", relation.after_batch_id),
+        ):
+            if value not in known:
+                raise InputError(
+                    f"precedence 第 {index + 1} 条: {role}={value} 不是已提交的批次号"
+                )

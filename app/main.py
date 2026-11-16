@@ -20,21 +20,31 @@ from .models import (
     DifferenceDetail,
     MinimizeRequest,
     MinimizeResponse,
+    OrderRequest,
+    OrderResponse,
     ValidateRequest,
     ValidateResponse,
 )
+from .ordering import OrderSearcher
 from .reducer import Reducer
 from .sqlguard import SqlPolicyError
 from .validate import InputError, validate_all
 
 app = FastAPI(
-    title="增量净额 SQL 反例精简器",
+    title="增量净额 SQL 反例精简器 + 乱序批次排序",
     version=__version__,
     description=(
-        "给出 orders/refunds 初始数据（合计至多 100 行）、至多 20 批增删改变更、"
-        "全量 SELECT 与增量 SQL，服务在隔离的内存 SQLite 中从全量初始成品出发逐批重放，"
-        "每批事务提交后按**多重集**比较全量结果与增量 result 表（重复行计入），"
-        "首次发现差异后自动删减批次，返回精简输入、首次差异的原批号以及缺失/多余行。\n\n"
+        "**A. 反例精简（/v1/minimize、/v1/validate）**：给出 orders/refunds 初始数据"
+        "（合计至多 100 行）、至多 20 批增删改变更、全量 SELECT 与增量 SQL，服务在隔离的"
+        "内存 SQLite 中从全量初始成品出发逐批重放，每批事务提交后按**多重集**比较全量结果"
+        "与增量 result 表（重复行计入），首次发现差异后自动删减批次，返回精简输入、首次"
+        "差异的原批号以及缺失/多余行。\n\n"
+        "**B. 乱序批次排序（/v1/orders）**：给出相同的初始数据、至多 8 个乱序批次、"
+        "必须遵守的批次先后关系，以及入仓后的权威 orders/refunds 完整快照。服务按与重放"
+        "完全相同的批内规则（批内延迟外键、改删目标须存在、主键唯一、批后外键成立）搜索"
+        "使用全部批次的可行顺序，终态必须与权威快照一致。唯一可行时返回该顺序；存在多种"
+        "时返回两个不同顺序并标记 ambiguous；无解（穷尽搜索）与搜索超限分别报告，"
+        "**未查完的分支不会被告成唯一或无解**。\n\n"
         "**安全与判定边界**\n"
         "- 全量 SQL 只读，只能访问 orders/refunds；增量 SQL 只能写 result。"
         "两条 SQL 都由 SQLite authorizer 强制约束。\n"
@@ -43,7 +53,9 @@ app = FastAPI(
         f"{config.STATEMENT_TIMEOUT_SECONDS:g} 秒，即标记为**无法判定**，"
         "不能作为缩减完成的依据。\n"
         "- 只有删除任一剩余批次都会使输入非法或消除差异时，才返回 "
-        "`reduced`/`already_minimal`。\n\n"
+        "`reduced`/`already_minimal`。\n"
+        "- 排序搜索受节点/时间预算约束；预算耗尽返回 `search_limit`，"
+        "已找到的可行顺序仍会返回，但不宣称唯一。\n\n"
         "**增量 SQL 可用的表**\n"
         "`orders(order_id, amount)`、`refunds(refund_id, order_id, amount)`、"
         "`batch_changes(...)`（本批前后值）、`result(order_id, net_amount)`。"
@@ -62,6 +74,8 @@ def health() -> dict[str, Any]:
         "max_result_rows": config.MAX_RESULT_ROWS,
         "max_trials": config.MAX_TRIALS,
         "max_request_seconds": config.MAX_REQUEST_SECONDS,
+        "max_order_search_nodes": config.MAX_ORDER_SEARCH_NODES,
+        "max_order_seconds": config.MAX_ORDER_SECONDS,
     }
 
 
@@ -143,4 +157,42 @@ def validate(request: ValidateRequest) -> ValidateResponse:
         first_difference_batch_id=batch_id,
         difference=difference,
         notes=result.notes,
+    )
+
+
+@app.post(
+    "/v1/orders",
+    response_model=OrderResponse,
+    summary="恢复乱序 CDC 批次的可行入仓顺序",
+    tags=["排序"],
+    responses={
+        422: {"description": "输入非法（初始数据/批次/先后关系/权威快照结构不合法）"},
+    },
+)
+def recover_order(request: OrderRequest) -> OrderResponse:
+    """Find executable orders for the submitted out-of-order batches.
+
+    Feasibility rules are identical to the replayer: per-batch atomic
+    application with deferred foreign keys, update/delete targets must exist,
+    primary keys stay unique, the foreign key holds after each batch, every
+    batch is used exactly once, the mandatory precedence relations hold, and
+    the final state equals the authoritative snapshot.  Replies ``unique`` /
+    ``ambiguous`` / ``no_solution`` / ``search_limit``; unfinished branches
+    never justify a uniqueness or unsolvability claim.
+    """
+    try:
+        outcome = OrderSearcher(
+            request.initial,
+            request.batches,
+            request.precedence,
+            request.authoritative,
+        ).run()
+    except InputError as exc:
+        raise HTTPException(status_code=422, detail=f"输入非法: {exc}") from exc
+    return OrderResponse(
+        status=outcome.status,  # type: ignore[arg-type]
+        orderings=outcome.orderings,
+        search_complete=outcome.search_complete,
+        searched_nodes=outcome.searched_nodes,
+        notes=outcome.notes,
     )

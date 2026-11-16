@@ -1,8 +1,15 @@
-# 增量净额 SQL 反例精简器
+# 增量净额 SQL 反例精简器 + 乱序批次排序
 
-面向结算数仓开发者的定位工具：给定 `orders`/`refunds` 初始数据、至多 20 批增删改变更、
-**全量 SELECT** 与**增量 SQL**，服务会自动找出增量维护净额表时的错误，并把导致错误的
-变更批次缩减到最小（保留原批号与原顺序），返回精简输入、首次差异批号以及缺失/多余行。
+面向结算数仓开发者的两个工具，共用同一套批内事务与外键规则：
+
+1. **反例精简**（`POST /v1/minimize`、`POST /v1/validate`）：给定 `orders`/`refunds`
+   初始数据、至多 20 批增删改变更、**全量 SELECT** 与**增量 SQL**，服务会自动找出增量
+   维护净额表时的错误，并把导致错误的变更批次缩减到最小（保留原批号与原顺序），返回
+   精简输入、首次差异批号以及缺失/多余行。
+2. **乱序批次排序**（`POST /v1/orders`）：给定相同的初始数据、至多 **8 个乱序批次**、
+   必须遵守的批次先后关系，以及入仓后的权威 `orders`/`refunds` 完整快照，恢复可入仓的
+   批次顺序。唯一可行时返回该顺序；存在多种时返回两个不同顺序并标记歧义；无解与搜索
+   超限分别报告。
 
 ## 快速开始
 
@@ -27,6 +34,10 @@ python3 -m pytest tests/ -q
 curl -s -X POST http://localhost:8000/v1/minimize \
      -H 'content-type: application/json' \
      --data-binary @examples/leak_refund_delete.json | python3 -m json.tool
+
+curl -s -X POST http://localhost:8000/v1/orders \
+     -H 'content-type: application/json' \
+     --data-binary @examples/order_batches.json | python3 -m json.tool
 ```
 
 `examples/leak_refund_delete.json` 是一个**漏处理退款删除**的样例：增量 SQL 处理了
@@ -144,10 +155,73 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 > 注意：缩减可能改变"首次差异批号"（删除更早的批次后，首个差异可能提前出现），
 > 返回的始终是**精简输入**中首次差异的原始批号，并在 `evaluations`/`notes` 中说明。
 
+## 乱序批次排序 API（`POST /v1/orders`）
+
+结算数仓收到的 CDC 批次可能乱序到达。该端点**不要求提交顺序本身可执行**，而是恢复
+可入仓的批次顺序。
+
+### 请求
+
+```jsonc
+{
+  "initial": { "orders": [...], "refunds": [...] },        // 与精简 API 相同，至多 100 行
+  "batches": [ {"batch_id": 203, "changes": [...]}, ... ], // 1~8 个乱序批次，批号唯一
+  "precedence": [                                           // 必须遵守的先后关系，可为空
+    {"before_batch_id": 201, "after_batch_id": 203}
+  ],
+  "authoritative": {                                        // 入仓后的权威完整快照
+    "orders":  [{"order_id": 1004, "amount": 700}, ...],
+    "refunds": [{"refund_id": 9002, "order_id": 1004, "amount": 300}, ...]
+  }
+}
+```
+
+- `precedence` 的两个批号必须都是已提交批次；同一批号自指由请求模型直接拒绝。
+  重复关系、传递冗余关系是允许的；**成环**不是输入错误，而是导致无解的约束。
+- `authoritative` 是**完整**快照：行序无关，但每一行、每个字段值都必须完全一致；
+  主键须唯一、退款外键须成立。其行数上界为 5000（初始 ≤100 行 + 8×200 个变更）。
+
+### 可行顺序的判定
+
+一个顺序可行，当且仅当：
+
+1. 它是**全部**批次的排列（不能跳过任何批次）；
+2. 满足全部 `precedence` 先后关系；
+3. 逐批应用时，每批都符合与重放器**完全相同**的批内规则：`update`/`delete` 目标须
+   存在、主键唯一、批后外键成立；同一批内允许先改主键再同步改引用行（延迟外键）；
+4. 最后一批之后的状态与 `authoritative` 快照**逐行逐值**一致。
+
+搜索为按批号序列的深度优先枚举；某前缀一旦使批次非法即剪枝（批效果确定，后续无法
+挽回）。先后关系成环时用 Kahn 算法一次判定，直接给出无解而不展开分支。
+
+### 返回字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `unique` / `ambiguous` / `no_solution` / `search_limit` |
+| `orderings` | 可行顺序（批号序列）。`unique` 恰好 1 个；`ambiguous` 恰好 2 个不同序列；无解时为 `[]`；`search_limit` 时可能为 0 或已找到的顺序 |
+| `search_complete` | 是否穷尽搜索空间。`ambiguous` 找到两种后提前停止，为 `false`；`unique`/`no_solution` 必为 `true` |
+| `searched_nodes` | 尝试扩展搜索前缀的次数（含被剪枝的尝试） |
+| `notes` | 判定依据（为何唯一/歧义/无解/超限） |
+
+判定边界：
+
+- **唯一**（`unique`）只有在搜索**穷尽**且恰好剩一个可行顺序时给出。
+- **歧义**（`ambiguous`）找到两个不同顺序即成立并提前停止——两种已足以证明不唯一。
+- **无解**（`no_solution`）只在搜索**穷尽**、所有分支都被排除时给出。
+- **搜索超限**（`search_limit`）在节点数或时间预算耗尽时给出；**未查完的分支不会**
+  被用来宣称唯一或无解。该状态下若已找到可行顺序会一并返回，但 `search_complete`
+  为 `false`。
+
+示例：`examples/order_batches.json`（5 个乱序批次，唯一顺序
+`[201, 202, 203, 204, 205]`）。
+
 ## 安全与隔离
 
 - 每次 `Executor.run` 新建内存数据库，连接不共享；FastAPI 同步端点在工作线程中运行，
   并发请求之间没有共享的可变状态。测试 `test_concurrent_requests_are_isolated` 覆盖。
+- 排序端点在进程内纯 Python 状态机上运行，不执行任何提交的 SQL，也不接触数据库文件；
+  每次请求新建 `OrderSearcher`，无共享可变状态。
 - 双层防护：文本预检（语句数、首关键字、禁止词、写目标表）+ SQLite
   `set_authorizer`（表级读写权限、禁止 DDL/ATTACH/PRAGMA/事务控制）。
 - 资源限制：单语句 1 秒（progress handler 中断）、结果行数上限、数据库页上限、值长度
@@ -165,6 +239,8 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 | `MAX_REQUEST_SECONDS` | `120` | 单请求总时限 |
 | `MAX_DB_PAGES` | `16384` | 每个试验库的页数上限 |
 | `MAX_VALUE_BYTES` | `1000000` | 单个值长度上限 |
+| `MAX_ORDER_SEARCH_NODES` | `200000` | 排序搜索的前缀扩展上限（8 批全枚举最坏 109600 次，可覆盖整个空间） |
+| `MAX_ORDER_SECONDS` | `120` | 排序请求总时限；耗尽即 `search_limit` |
 
 ## 已知限制
 
@@ -174,7 +250,11 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 - 缩减只针对批次层面；单个批次内部的多个 `change` 不会被拆开或删减。
 - SQLite 是单线程内存库；每次试验重建数据库，因此候选评估的成本与批次数、数据量成正比
   （数据上限 100 行、20 批，实测示例 9 次评估内完成）。
-- 不处理跨请求的持久化或任务队列；请求是同步完成的（超时受 `MAX_REQUEST_SECONDS` 约束）。
+- 排序搜索不打断批次：一个批次是一个原子单位，顺序只决定批次间的相对位置。
+- 排序是纯 CPU 的同步枚举（8 批最坏约 11 万次前缀扩展，实测 <1 秒）；结果与批次的
+  `changes` 内容绑定，不做跨请求缓存。
+- 不处理跨请求的持久化或任务队列；请求是同步完成的（超时受 `MAX_REQUEST_SECONDS`
+  与 `MAX_ORDER_SECONDS` 约束）。
 
 ## 目录结构
 
@@ -187,7 +267,8 @@ app/
   sqlguard.py   SQL 策略（文本预检 + authorizer）
   executor.py   单次试验：重建库、逐批事务、多重集比较
   reducer.py    ddmin 缩减与最小性认证
+  ordering.py   乱序批次排序：可行顺序枚举、歧义/无解/超限判定
   config.py     环境变量配置
-tests/          92 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、API、契约）
-examples/       正确实现与漏删退款的反例
+tests/          124 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、排序、API、契约）
+examples/       正确实现、漏删退款的反例、乱序批次排序样例
 ```

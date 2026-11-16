@@ -1,0 +1,68 @@
+{
+  "initial": {
+    "orders": [
+      {"order_id": 1001, "amount": 5000},
+      {"order_id": 1002, "amount": 3000}
+    ],
+    "refunds": [
+      {"refund_id": 9001, "order_id": 1001, "amount": 1200}
+    ]
+  },
+  "batches": [
+    {
+      "batch_id": 203,
+      "changes": [
+        {"op": "update", "table": "orders",
+         "before": {"order_id": 1004},
+         "after": {"order_id": 1004, "amount": 700}}
+      ]
+    },
+    {
+      "batch_id": 201,
+      "changes": [
+        {"op": "insert", "table": "orders",
+         "after": {"order_id": 1003, "amount": 800}}
+      ]
+    },
+    {
+      "batch_id": 205,
+      "changes": [
+        {"op": "update", "table": "refunds",
+         "before": {"refund_id": 9002},
+         "after": {"refund_id": 9002, "order_id": 1004, "amount": 300}}
+      ]
+    },
+    {
+      "batch_id": 202,
+      "changes": [
+        {"op": "update", "table": "orders",
+         "before": {"order_id": 1003},
+         "after": {"order_id": 1004, "amount": 800}}
+      ]
+    },
+    {
+      "batch_id": 204,
+      "changes": [
+        {"op": "insert", "table": "refunds",
+         "after": {"refund_id": 9002, "order_id": 1004, "amount": 500}}
+      ]
+    }
+  ],
+  "precedence": [
+    {"before_batch_id": 201, "after_batch_id": 202},
+    {"before_batch_id": 202, "after_batch_id": 203},
+    {"before_batch_id": 203, "after_batch_id": 204},
+    {"before_batch_id": 204, "after_batch_id": 205}
+  ],
+  "authoritative": {
+    "orders": [
+      {"order_id": 1001, "amount": 5000},
+      {"order_id": 1002, "amount": 3000},
+      {"order_id": 1004, "amount": 700}
+    ],
+    "refunds": [
+      {"refund_id": 9001, "order_id": 1001, "amount": 1200},
+      {"refund_id": 9002, "order_id": 1004, "amount": 300}
+    ]
+  }
+}

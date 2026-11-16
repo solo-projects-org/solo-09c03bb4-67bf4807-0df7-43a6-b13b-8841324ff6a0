@@ -36,14 +36,42 @@ class RefundRow(BaseModel):
     )
 
 
-class InitialData(BaseModel):
+class SnapshotData(BaseModel):
+    """A complete ``orders``/``refunds`` snapshot.
+
+    Used both for the initial state (through :class:`InitialData`, which adds
+    the 100-row input cap) and for the authoritative final snapshot of the
+    ordering API (which has no arbitrary row cap: the replayed final state may
+    be larger than the initial state).
+    """
+
     orders: list[OrderRow] = Field(default_factory=list)
     refunds: list[RefundRow] = Field(default_factory=list)
 
+
+class InitialData(SnapshotData):
     @model_validator(mode="after")
     def _check_limits(self) -> "InitialData":
         if len(self.orders) + len(self.refunds) > 100:
             raise ValueError("orders + refunds 合计至多 100 行")
+        return self
+
+
+class AuthoritativeSnapshot(SnapshotData):
+    """The authoritative post-ingestion state (full ``orders``/``refunds``).
+
+    A feasible ordering must consume every batch and end in exactly this
+    state.  Row order is irrelevant; primary keys must be unique and every
+    refund must reference an existing order.
+    """
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "AuthoritativeSnapshot":
+        # The final state starts from the <=100 initial rows and each of the
+        # <=8 batches holds <=200 changes, so at most 1700 rows can exist.
+        # The cap is a payload bound, not a semantic restriction.
+        if len(self.orders) + len(self.refunds) > 5000:
+            raise ValueError("authoritative 快照合计至多 5000 行（超出可生成范围）")
         return self
 
 
@@ -171,3 +199,81 @@ class ValidateResponse(BaseModel):
     first_difference_batch_id: int | None = None
     difference: DifferenceDetail | None = None
     notes: list[str] = Field(default_factory=list)
+
+
+class PrecedenceConstraint(BaseModel):
+    """A mandatory ordering relation between two different batches."""
+
+    before_batch_id: int = Field(
+        ..., ge=1, description="必须先执行的批次号（必须早于 after_batch_id）"
+    )
+    after_batch_id: int = Field(
+        ..., ge=1, description="必须后执行的批次号（必须晚于 before_batch_id）"
+    )
+
+    @model_validator(mode="after")
+    def _different_batches(self) -> "PrecedenceConstraint":
+        if self.before_batch_id == self.after_batch_id:
+            raise ValueError("先后关系的两个批次号不能相同")
+        return self
+
+
+class OrderRequest(BaseModel):
+    """Request for the batch-ordering API.
+
+    ``batches`` are the out-of-order CDC batches (at most 8).  ``precedence``
+    lists mandatory "before -> after" relations between batch ids (both ids
+    must name a submitted batch).  ``authoritative`` is the complete
+    ``orders``/``refunds`` snapshot that must hold after ingesting **all**
+    batches.
+
+    Unlike the minimizer endpoints, the submitted batch order itself does not
+    have to be executable: recovering an executable order is the task.
+    """
+
+    initial: InitialData
+    batches: list[Batch] = Field(
+        ..., min_length=1, max_length=8, description="乱序 CDC 批次，1 至 8 个"
+    )
+    precedence: list[PrecedenceConstraint] = Field(default_factory=list)
+    authoritative: AuthoritativeSnapshot
+
+    @model_validator(mode="after")
+    def _unique_batches(self) -> "OrderRequest":
+        ids = [b.batch_id for b in self.batches]
+        if len(ids) != len(set(ids)):
+            raise ValueError("batch_id 必须唯一")
+        return self
+
+
+OrderStatus = Literal["unique", "ambiguous", "no_solution", "search_limit"]
+
+
+class OrderResponse(BaseModel):
+    status: OrderStatus = Field(
+        ...,
+        description=(
+            "unique=唯一可行顺序；ambiguous=至少两种可行顺序；"
+            "no_solution=已穷尽搜索且无可行顺序；"
+            "search_limit=搜索预算耗尽，存在未检查的分支（不能宣称唯一或无解）"
+        ),
+    )
+    orderings: list[list[int]] = Field(
+        default_factory=list,
+        description=(
+            "可行顺序的批号序列。unique 时恰好 1 个；ambiguous 时恰好 2 个"
+            "不同序列；no_solution / search_limit 未找到时为 0 个，"
+            "search_limit 时若已找到可行顺序也会返回（但不得据此宣称唯一）"
+        ),
+    )
+    search_complete: bool = Field(
+        ...,
+        description=(
+            "是否穷尽了整个搜索空间。ambiguous 在找到两个不同顺序后提前停止，"
+            "因此为 false；unique / no_solution 必须为 true"
+        ),
+    )
+    searched_nodes: int = Field(
+        ..., description="本次搜索尝试扩展搜索前缀的次数（含被剪枝的尝试）"
+    )
+    notes: list[str] = Field(default_factory=list, description="判定依据说明")
